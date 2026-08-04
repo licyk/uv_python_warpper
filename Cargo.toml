@@ -1,0 +1,15 @@
+[package]
+name = "uv_python_warpper"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[dependencies]
+
+[[bin]]
+name = "python"
+path = "src/bin/python.rs"
+
+[[bin]]
+name = "pip"
+path = "src/bin/pip.rs"
