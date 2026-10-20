@@ -2,7 +2,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
+    process::{Command, Stdio},
 };
 
 const REENTRY_GUARD_ENV: &str = "UV_PYTHON_WRAPPER_ACTIVE";
@@ -53,7 +53,7 @@ fn find_python(current_exe: &Path) -> Result<OsString, Box<dyn std::error::Error
     let wrapper_dir = current_exe
         .parent()
         .ok_or("failed to determine the wrapper directory")?;
-    let python_search_path = exclude_directory_from_path(&path, wrapper_dir)?;
+    let python_search_path = exclude_wrapper_from_path(&path, wrapper_dir)?;
 
     let output = Command::new(uv)
         .args(["python", "find", "--system"])
@@ -105,14 +105,20 @@ fn python_executable_name() -> &'static str {
     }
 }
 
-fn exclude_directory_from_path(
+fn exclude_wrapper_from_path(
     path: &OsStr,
-    excluded_directory: &Path,
+    wrapper_directory: &Path,
 ) -> Result<OsString, env::JoinPathsError> {
-    env::join_paths(
-        env::split_paths(path)
-            .filter(|directory| !paths_refer_to_same_location(directory, excluded_directory)),
-    )
+    let wrapper_python = wrapper_directory.join(python_executable_name());
+
+    // A PATH directory can also expose the wrapper through an executable symlink.
+    env::join_paths(env::split_paths(path).filter(|directory| {
+        !(paths_refer_to_same_location(directory, wrapper_directory)
+            || paths_refer_to_same_location(
+                &directory.join(python_executable_name()),
+                &wrapper_python,
+            ))
+    }))
 }
 
 fn validate_python_path(
@@ -205,14 +211,14 @@ fn run_windows(python: OsString, args: Vec<OsString>) -> Result<i32, Box<dyn std
 }
 
 #[cfg(windows)]
-fn exit_code(status: ExitStatus) -> i32 {
+fn exit_code(status: std::process::ExitStatus) -> i32 {
     status.code().unwrap_or(1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Program, command_args, exclude_directory_from_path, python_executable_name,
+        Program, command_args, exclude_wrapper_from_path, python_executable_name,
         validate_python_path,
     };
     use std::{env, ffi::OsString, path::PathBuf};
@@ -250,7 +256,98 @@ mod tests {
         let other_dir = wrapper_dir.parent().unwrap().to_path_buf();
         let path = env::join_paths([wrapper_dir.clone(), other_dir.clone()]).unwrap();
 
-        let filtered = exclude_directory_from_path(&path, &wrapper_dir).unwrap();
+        let filtered = exclude_wrapper_from_path(&path, &wrapper_dir).unwrap();
+
+        assert_eq!(env::split_paths(&filtered).collect::<Vec<_>>(), [other_dir]);
+    }
+
+    #[test]
+    fn all_wrapper_directory_entries_are_excluded_and_other_entries_keep_their_order() {
+        let wrapper_dir = env::current_dir().unwrap();
+        let first = wrapper_dir.join("first directory");
+        let second = wrapper_dir.join("目录");
+        let path = env::join_paths([
+            first.clone(),
+            wrapper_dir.clone(),
+            second.clone(),
+            wrapper_dir.join("."),
+            first.clone(),
+        ])
+        .unwrap();
+
+        let filtered = exclude_wrapper_from_path(&path, &wrapper_dir).unwrap();
+
+        assert_eq!(
+            env::split_paths(&filtered).collect::<Vec<_>>(),
+            [first.clone(), second, first],
+        );
+    }
+
+    #[test]
+    fn relative_and_empty_entries_resolving_to_wrapper_directory_are_excluded() {
+        let wrapper_dir = env::current_dir().unwrap();
+        let other_dir = wrapper_dir.join("other");
+        let path = env::join_paths([
+            PathBuf::new(),
+            PathBuf::from("."),
+            PathBuf::from("src/.."),
+            other_dir.clone(),
+        ])
+        .unwrap();
+
+        let filtered = exclude_wrapper_from_path(&path, &wrapper_dir).unwrap();
+
+        assert_eq!(env::split_paths(&filtered).collect::<Vec<_>>(), [other_dir]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_and_executable_symlinks_to_wrapper_are_excluded() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let fixture =
+            env::temp_dir().join(format!("uv-python-wrapper-path-{}", std::process::id()));
+        let wrapper_dir = fixture.join("wrapper");
+        let directory_alias = fixture.join("directory alias");
+        let executable_alias = fixture.join("executable alias");
+        let other_dir = fixture.join("other");
+        fs::create_dir(&fixture).unwrap();
+        fs::create_dir(&wrapper_dir).unwrap();
+        fs::create_dir(&executable_alias).unwrap();
+        fs::create_dir(&other_dir).unwrap();
+        fs::write(wrapper_dir.join("python"), b"wrapper").unwrap();
+        fs::write(other_dir.join("python"), b"real python").unwrap();
+        symlink(&wrapper_dir, &directory_alias).unwrap();
+        symlink(wrapper_dir.join("python"), executable_alias.join("python")).unwrap();
+        let path = env::join_paths([
+            wrapper_dir.clone(),
+            directory_alias,
+            other_dir.clone(),
+            executable_alias,
+        ])
+        .unwrap();
+
+        let filtered = exclude_wrapper_from_path(&path, &wrapper_dir);
+        fs::remove_dir_all(&fixture).unwrap();
+
+        assert_eq!(
+            env::split_paths(&filtered.unwrap()).collect::<Vec<_>>(),
+            [other_dir],
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_wrapper_directory_matching_is_case_insensitive() {
+        let wrapper_dir = env::current_dir().unwrap();
+        let other_dir = wrapper_dir.join("other;directory");
+        let path = env::join_paths([
+            PathBuf::from(wrapper_dir.to_str().unwrap().to_ascii_uppercase()),
+            other_dir.clone(),
+        ])
+        .unwrap();
+
+        let filtered = exclude_wrapper_from_path(&path, &wrapper_dir).unwrap();
 
         assert_eq!(env::split_paths(&filtered).collect::<Vec<_>>(), [other_dir]);
     }

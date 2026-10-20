@@ -25,3 +25,5 @@ cargo build --release
 ```
 
 运行前需要安装并确保 `uv` 已在 `PATH` 中。
+
+调用 `uv` 时会从其 `PATH` 中移除 wrapper 所在目录及指向 wrapper 的 `python` 符号链接所在目录，避免递归调用。路径处理兼容 Windows、Linux 和 macOS；实际 Python 执行时仍保留原始 `PATH`。
