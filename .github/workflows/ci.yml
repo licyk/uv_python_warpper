@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What to run (release is allowed only on main)
+        type: choice
+        default: build
+        options: [check, build, release]
+
+permissions:
+  contents: read
+
+# Keep each main commit's release alive when another commit arrives. PR updates
+# may cancel obsolete checks; tag pushes never start another test workflow.
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.run_id || 'latest' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      sha: ${{ steps.plan.outputs.sha }}
+      rust: ${{ steps.plan.outputs.rust }}
+      build: ${{ steps.plan.outputs.build }}
+      publish: ${{ steps.plan.outputs.publish }}
+      checks_matrix: ${{ steps.plan.outputs.checks_matrix }}
+      build_matrix: ${{ steps.plan.outputs.build_matrix }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.13'
+      - id: plan
+        env:
+          CI_MODE: ${{ inputs.mode || 'auto' }}
+          BEFORE: ${{ github.event.before }}
+        run: python scripts/ci.py plan
+
+  checks:
+    name: Checks
+    needs: plan
+    uses: ./.github/workflows/checks.yml
+    with:
+      rust: ${{ needs.plan.outputs.rust }}
+      matrix: ${{ needs.plan.outputs.checks_matrix }}
+
+  build:
+    name: Build
+    needs: [plan, checks]
+    if: needs.plan.outputs.build == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      rust: ${{ needs.plan.outputs.rust }}
+      matrix: ${{ needs.plan.outputs.build_matrix }}
+
+  release:
+    name: Release
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      version: ${{ needs.plan.outputs.version }}
+      tag: ${{ needs.plan.outputs.tag }}
+      sha: ${{ needs.plan.outputs.sha }}
+
+  passed:
+    name: CI passed
+    needs: [plan, checks, build, release]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Results: $RESULTS"
+          case " $RESULTS " in *" failure "*|*" cancelled "*) exit 1 ;; esac

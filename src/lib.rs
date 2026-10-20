@@ -5,6 +5,14 @@ use std::{
     process::{Command, Stdio},
 };
 
+mod lookup;
+#[cfg(unix)]
+#[path = "platform/unix.rs"]
+mod platform;
+#[cfg(windows)]
+#[path = "platform/windows.rs"]
+mod platform;
+
 const REENTRY_GUARD_ENV: &str = "UV_PYTHON_WRAPPER_ACTIVE";
 
 #[derive(Clone, Copy)]
@@ -17,6 +25,13 @@ pub fn main_for(program: Program) {
     match run(program) {
         Ok(code) => std::process::exit(code),
         Err(err) => {
+            if let Some(code) = err
+                .downcast_ref::<lookup::Interrupted>()
+                .map(|interrupted| interrupted.0)
+                .or_else(platform::interrupted_exit_code)
+            {
+                std::process::exit(code);
+            }
             eprintln!("{err}");
             std::process::exit(1);
         }
@@ -32,17 +47,24 @@ fn run(program: Program) -> Result<i32, Box<dyn std::error::Error>> {
         .into());
     }
 
+    let interrupts = platform::InterruptGuard::install()?;
     let current_exe = env::current_exe()?;
     let python = find_python(&current_exe)?;
     let args = command_args(program, env::args_os().skip(1));
 
     #[cfg(unix)]
     {
+        // Restore inherited signal dispositions before replacing this process.
+        drop(interrupts);
+        lookup::check_interrupted()?;
         run_unix(python, args)
     }
 
     #[cfg(windows)]
     {
+        // Keep the console handler alive while Python handles its own console events.
+        let _interrupts = interrupts;
+        lookup::check_interrupted()?;
         run_windows(python, args)
     }
 }
@@ -55,13 +77,15 @@ fn find_python(current_exe: &Path) -> Result<OsString, Box<dyn std::error::Error
         .ok_or("failed to determine the wrapper directory")?;
     let python_search_path = exclude_wrapper_from_path(&path, wrapper_dir)?;
 
-    let output = Command::new(uv)
-        .args(["python", "find", "--system"])
-        .env("PATH", python_search_path)
-        .env(REENTRY_GUARD_ENV, current_exe)
-        .stdin(Stdio::null())
-        .stderr(Stdio::inherit())
-        .output()?;
+    let output = lookup::output(
+        Command::new(uv)
+            .args(["python", "find", "--system"])
+            .env("PATH", python_search_path)
+            .env(REENTRY_GUARD_ENV, current_exe)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit()),
+    )?;
 
     if !output.status.success() {
         return Err(format!(
