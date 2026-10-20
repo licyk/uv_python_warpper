@@ -36,15 +36,8 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: false
-      - name: Install musl linker
-        if: matrix.musl
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes musl-tools
-          key="CARGO_TARGET_$(printf '%s' "$TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER"
-          echo "$key=musl-gcc" >> "$GITHUB_ENV"
+      # Use Rust's bundled musl libraries with the native linker. Older musl-gcc
+      # wrappers produce broken x86_64 static PIE executables.
       - name: Build both programs
         env:
           TARGET: ${{ matrix.target }}
